@@ -1,0 +1,288 @@
+---
+title: "Desigualdad Socioespacial en la Provincia de Quillota: Relación entre Hacinamiento y Escolaridad"
+author: "Catalina López"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+# 1.Introducción
+
+Las condiciones habitacionales y educativas son factores fundamentales para comprender la distribución del bienestar social y las desigualdades territoriales dentro de un país. En contextos urbanos y rurales, las variables relacionadas con el hacinamiento y la escolaridad permiten aproximarse a la calidad de vida y al acceso a oportunidades que poseen los distintos grupos sociales. En particular, el hacinamiento, siendo la cantidad de personas que viven en un espacio reducido, es un indicador sensible de vulnerabilidad social. Por otro lado, la escolaridad refleja el capital humano y las posibilidades de movilidad socioeconómica de una población.
+
+En el caso de Chile, la dinámica territorial muestra marcadas diferencias entre comunas y provincias, expresadas tanto en los niveles de ingreso como en las condiciones de vivienda y educación. Estas disparidades se han profundizado en las últimas décadas debido al crecimiento urbano descontrolado, la segregación socioespacial y las desigualdades en la distribución de infraestructura y servicios básicos. En este contexto, el Censo de Población y Vivienda 2017, elaborado por el Instituto Nacional de Estadísticas (INE), se convierte en una fuente clave para examinar estas dimensiones de manera desagregada y espacialmente explícita.
+
+A continuación se desea explorar la relación entre hacinamiento y escolaridad en la Provincia de Quillota, a través de indicadores censales y herramientas de análisis geoespacial, con el fin de identificar patrones espaciales que evidencian cómo las condiciones habitacionales pueden estar asociadas con el nivel educativo de la población.
+
+## 1.1 Objetivo General
+
+Evaluar la distribución espacial entre el hacinamiento y la baja escolaridad en la provincia de Quillota, empleando datos del censo del año 2017, a través de un mapa bivariado.
+
+## 1.2 Objetivos Especificos
+
+1\. Clacular indicadores porcentiales de las variables escogidas.
+
+2\. Generar mapas tematicos de cada variable, junto con un EDA.
+
+3\. Generar un mapa bivariado entre las variables seleccionadas e identifiar tnedencias y patrones.
+
+# 2.Desarrollo
+
+## 2.1 Metodologia
+
+El análisis se realizó utilizando la base de datos CENSO2017_v del Censo de Población y Vivienda 2017 del Instituto Nacional de Estadísticas (INE) de Chile, la cual contiene información detallada de personas, hogares y viviendas, así como referencias geográficas de zonas censales y comunas. Esta base fue almacenada y consultada desde un servidor PostgreSQL con extensión PostGIS, lo que permitió trabajar con datos espaciales de manera eficiente y realizar agregaciones georreferenciadas a nivel de zona censal.
+
+El procesamiento y análisis se llevó a cabo en RStudio y pgAdmin, procesando los datos del censo y filtrando las tablas correspondientes.
+
+## 2.2 Librerias
+
+Para el desarrollo se implementaron las siguientes librerías:
+
+```{r librerias, echo=TRUE, message=FALSE, warning=FALSE}
+library(DBI)
+library(RPostgres)
+library(sf) 
+library(ggplot2)
+library(viridis)
+library(cowplot)
+library(biscale)
+```
+
+## 
+
+## 2.3 Conecciones bases de datos postgreSQL
+
+Se hizo una conexion con la base de datos del censo 2017 de la region de valparaiso.
+
+```{r conexiones, echo=TRUE, message=FALSE, warning=FALSE}
+con = dbConnect(
+  Postgres(),
+  dbname   =  "censo_v_2017",
+  host     = "localhost",
+  port     = 5432,
+  user     = "postgres",
+  password = "postgres"
+)
+```
+
+Las variables que se consideraron fueron:
+
+\- escolaridad: años de escolaridad (0-26), donde se trabajo con datos menores a 8, para evaluar la baja escolaridad.
+
+\- ind_hacin: tasa de hacinamiento, donde se consideraron datos de alto y crítico nivel de hacinamiento.
+
+Junto a lo anterior, se consideraron conexiones con la geometria de la provincia y las comunas correspondientes a esta, teniendo en cuenta las zonas censales de la region de Valparaiso, donde la consulta SQL generó una tabla con:
+
+```{r consulta sql, echo=TRUE, message=FALSE, warning=FALSE}
+consulta_sql= "WITH agg AS 
+(
+
+SELECT 
+
+z.geocodigo::double precision AS geocodigo,
+c.nom_comuna,
+
+ -- % de personas con hacinamiento alto o crítico (3 o 4)
+        ROUND(
+            COUNT(*) FILTER (WHERE v.ind_hacin IN (3,4)) * 100.0 / COUNT(*), 2
+        ) AS pct_hacinamiento,
+    
+-- % escolaridad
+
+ROUND(
+    COUNT(*) FILTER (WHERE p.escolaridad <= 8) * 100.0 / COUNT(*), 2
+    ) AS ptje_esc_baja
+
+FROM public.personas   AS p
+    JOIN public.hogares    AS h ON p.hogar_ref_id    = h.hogar_ref_id
+    JOIN public.viviendas  AS v ON h.vivienda_ref_id = v.vivienda_ref_id
+    JOIN public.zonas      AS z ON v.zonaloc_ref_id  = z.zonaloc_ref_id
+    JOIN public.comunas    AS c ON z.codigo_comuna   = c.codigo_comuna
+    JOIN public.provincias AS pr ON c.provincia_ref_id = pr.provincia_ref_id
+    WHERE pr.nom_provincia = 'QUILLOTA'
+    GROUP BY z.geocodigo, c.nom_comuna
+
+)
+
+SELECT  a.geocodigo,
+    shp.geom,
+    a.nom_comuna,
+    a.pct_hacinamiento,
+    a.ptje_esc_baja
+FROM agg AS a
+JOIN dpa.zonas_censales_v AS shp 
+    ON shp.geocodigo = a.geocodigo;
+"
+
+```
+
+```{r guarda, echo=TRUE, message=FALSE, warning=FALSE}
+df_indicadores= st_read(con, query = consulta_sql)
+
+```
+
+Adicional se generó un SQL para la selección de las comunas con las cuales se trabajaría, que pertenecen a la provincia de Quillota:
+
+```{r comunas, echo=TRUE, message=FALSE, warning=FALSE}
+sql_comunas = "
+
+SELECT nom_comuna, geom
+FROM dpa.comunas_v
+WHERE nom_provin = 'QUILLOTA';
+
+" 
+sf_comunas= st_read(con, query = sql_comunas)
+```
+
+## 2.4 Indicadores
+
+Para este análisis se derivaron los indicadores menionados desde nuestra base de datos, enfocados en la provincia de Quillota:
+
+1.  Porcentaje de hogares con hacinamiento alto o crítico (pct_hacinamiento):
+
+-   Se consideraron los hogares con índice de hacinamiento 3 o 4, según la codificación de la base de datos.
+
+-   Este indicador refleja el porcentaje de personas que viven en condiciones de espacio reducido, lo que se asocia a vulnerabilidad social, menor calidad de vida y posibles problemas de salud.\
+
+2.  Porcentaje de personas con baja escolaridad (ptje_esc_baja):
+
+-   Se consideraron personas con 8 años de estudio o menos, que equivale a finalizar la educación básica en Chile.
+
+-   Este indicador representa la proporción de la población con un nivel educativo limitado, lo cual puede limitar sus oportunidades laborales y socioeconómicas.
+
+Estos indicadores se calcularon a nivel de zona censal, lo que permite analizar la distribución espacial dentro de la provincia y detectar patrones de vulnerabilidad concentrada.
+
+## 2.5 Productos
+
+Se generó 1 gráfico de dispersión y 3 mapas temáticos :
+
+1.  Relación entre hacinamiento y baja escolaridad: este grafico de dispersión nos muestra la relación estadistica entre las dos variables, donde se agregó una línea de tendencia para vislumbrar mejor los comportamientos, donde cada punto representa una zona censal.
+2.  Distribución del hacinamiento alto o crítico: muestra la distribución espacial de personas que viven bajo condiciones de hacinamiento altas y críticas en la provincia de Quillota.
+3.  Distribución de la baja escolaridad: representa la proporción de personas con menos de 8 años de estudio, es decir que no terminaron la enseñanza básica.
+4.  Mapa bivariado: integra ambos indicadores, mostrando de manera simultanea las zonas donde hay mayor cncentración de baja escolaridad y alto hacinamiento.
+
+# 3.Resultados y Análisis
+
+De el análisis y procesamiento de la base de datos, con los indicadores se presentan los siguientes resultados:
+
+Gráfico de dispersión:
+
+```{r dispersión, echo=FALSE, message=FALSE, warning=FALSE}
+
+ggplot(df_indicadores, aes(x = pct_hacinamiento, y = ptje_esc_baja)) +
+  geom_point(color = "#1f78b4", size = 2, alpha = 0.7) +
+  geom_smooth(method = "lm", se = TRUE, color = "red", linetype = "dashed") +
+  labs(
+    title = "Relación entre Hacinamiento y Baja Escolaridad - Provincia de Quillota",
+    x = "% de Población con Hacinamiento Alto o Crítico",
+    y = "% de Población con Baja Escolaridad (≤8 años)"
+  ) +
+  theme_minimal()
+
+```
+
+En el gráfico anterior se puede evidenciar una tendencia de que a mayor grado de hacinamiento, se presenta una menor escolaridad. Si bien, hay un comportaiento variado, se logra identificar una leve tendencia, lo que representa un alto grado de vulnerabilidad problaciona, donde se dificulta el acceso a educación o un buen desarrollo y continuidad de este, frente a situaciones de vivienda precarias.
+
+A continuación se presenta el mapa de hacinamiento:
+
+```{r hacinamiento, echo=FALSE, message=FALSE, warning=FALSE}
+map_hacinamiento <- ggplot(df_indicadores) +
+  geom_sf(aes(fill = pct_hacinamiento), color = "gray80", size = 0.2) +
+  scale_fill_viridis_c(
+    option = "magma", 
+    direction = -1,
+    name = "% Hacinamiento alto o crítico") +
+  labs(
+    title = "Distribución del Hacinamiento Alto o Crítico\nProvincia de Quillota") +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 13, face = "bold"),
+    legend.position = "right"
+  )
+
+print(map_hacinamiento)
+```
+
+En este mapa se indentifica una situación bien variada con respecto al hacinamiento en la provincia, donde, en general hay rangos menores de alto y crítico hacinamiento. No obstante, se identifican 3 localidades críticas. Complementando, los secores que mayor presentan hacinamiento, son principalmente rurales, por lo que se puede relacionar este fenómento con un bajo acceso a servicios básicos, ya que si bien en las zonas urbanas tambinén hay presencia, la tendencia es menor a comparación.
+
+El mapa que se evidencia a continuación corresponde a la escolaridad:
+
+```{r escolaridad, echo=FALSE, message=FALSE, warning=FALSE}
+map_escolaridad <- ggplot(df_indicadores) +
+  geom_sf(aes(fill = ptje_esc_baja), color = "gray80", size = 0.2) +
+  scale_fill_viridis_c(
+    option = "plasma", 
+    direction = -1,
+    name = "% Baja escolaridad (≤8 años)") +
+  labs(
+    title = "Distribución de la Baja Escolaridad\nProvincia de Quillota") +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 13, face = "bold"),
+    legend.position = "right"
+  )
+
+print(map_escolaridad)
+```
+
+En el mapa representado, se observa que también existe una relación entre la ruralidad y la baja escolaridad. por lo que se refuerza el deficit de acceso a servicios en el desarrollo educacional de la población, dedicando posiblemente sus prioridades al desarrollo del entorno rural.
+
+Finalmente se presenta el mápa bivariado:
+
+```{r mapa bivariado, echo=FALSE, message=FALSE, warning=FALSE}
+df_bi <- bi_class(
+  df_indicadores,
+  x = ptje_esc_baja,      # variable 1: baja escolaridad
+  y = pct_hacinamiento,   # variable 2: hacinamiento
+  dim = 3,                # número de clases
+  style = "jenks"         # método de clasificación
+)
+
+mapa_bivariado <- ggplot() +
+  geom_sf(data = df_bi, aes(fill = bi_class), color = NA) +
+  geom_sf(data = sf_comunas, fill = NA, color = "black", size = 0.3) +
+  bi_scale_fill(pal = "DkBlue", dim = 3) +
+  labs(
+    title = "Mapa Bivariado: Baja Escolaridad vs Hacinamiento\nProvincia de Quillota"
+  ) +
+  theme_void() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 15)
+  )
+
+leyenda_bi <- bi_legend(
+  pal = "DkBlue", dim = 3,
+  xlab = "← Menor escolaridad | Mayor escolaridad →",
+  ylab = "← Menor hacinamiento | Mayor hacinamiento →",
+  size = 8
+)
+
+mapa_final_bi <- ggdraw() +
+  draw_plot(mapa_bivariado, 0, 0, 1, 1) +
+  draw_plot(leyenda_bi, 0.7, 0.05, 0.25, 0.25)
+
+print(mapa_final_bi)
+```
+
+En este mapa se identifican 3 grandes zonas donde hay alto porcentaje de personas que viven en condiciones de hacinamiento y baja escolaridad. como se deduce de igual forma en los gráficos anteriores, son principalmente rurales, lo que viene a reforzar y evidenciar una relación entre estos dos indicadores en condjunto, presentanto una deficienza en los sectores de mayor ruralidad poblacional, donde si bien abarcan grandes áreas, en general la infraestructura resulta no ser suficiente debido al alto porcentaje de personas que habitan en una misma vivienda. Esto evidencia que resulta urgente atender las localidades más alegadas para captar a población que se eduque, y evaluar la entrega de recursos para mejorar las condiciones de habitación.
+
+Caso opuesto se evidencia en las zonas más ubanizadas, dondecsi bien el territorio que ocupan es más reducido, poseen mejores accesos a sevicios y educación.
+
+Este tipo de mapas, que convina dos o más variables nos permite relacionar diferentes factores que pueden ser distintos en su dessrrollo y aspecto de evaluación, pero es posible identificar tendencias y patrones para explicar otros fenómenos que se emplazan en el territorio, o reconocer así, las brechas que se presentar entre el entorno rural y urbano.
+
+# 4.Conclusiones
+
+A modo general, el análisis evidencia la existencia de una relación entre la escolaridad y el hacinamiento en la provincia de Quillota, donde las zonas con mayor hacinamiento tienden a presentar porcentajes más altos de población con ≤8 años de estudio, lo que refleja la interacción entre condiciones habitacionales precarias y limitaciones en capital humano. Además se pudo evidenciar una relación entre estos indicadores y la ruralidad, doen a mayor ruralidad, más presencia de vulnerabilidad se presenta.
+
+Los mapas univariados nos permiten ver que tanto el hacinamiento como la baja escolaridad se concentran principalmente en las zonas rurales, mientras que las áreas urbanizadas presentan menores porcentajes de vulnerabilidad, reflejando así brechas socioespaciales dentro de la provincia. Esto se respalda con el gráfico de dipersión el cual presentó tendencias, pero con variabilidad entre zonas.
+
+El mapa bivariado permite identificar zonas críticas donde convergen ambos factores, facilitando la focalización de políticas públicas para mejorar la educación y las condiciones de vivienda en territorios más vulnerables.
+
+Así, es posible concluir que en conjunto, estos análisis destacan la importancia de integrar distintos tipos de variables, tanto espaciales como sociales con la finalidad de lograr una mejor compresnión de cómo se presentan las desigualdades en el territorio, dando paso a la identificación de prioridades a enfocar.
+
+# 5.Bibliografía
+
+**Instituto Nacional de Estadísticas (INE).** (2017). *Censo de Población y Vivienda 2017*. Recuperado de: <https://www.ine.cl>
+
+**Biblioteca del Congreso Nacional de Chile (BCN).** (s.f.). *Información legislativa y territorial de Chile*. Recuperado de: <https://www.bcn.cl>
+
+**Gobierno Regional de Valparaíso.** (2020). *Diagnóstico Territorial y Social de la Región de Valparaíso*. Valparaíso: GORE Valparaíso.
