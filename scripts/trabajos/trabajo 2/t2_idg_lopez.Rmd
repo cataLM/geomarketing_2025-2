@@ -256,19 +256,20 @@ names(zonas_hipert) <- c("geocodigo", "porc_hipertension")
 Una vez hecha la microsimulación, se realizó una conexión a la base de datos del censo 2017 de la RM:
 
 ```{r conexiones, echo=TRUE, message=FALSE, warning=FALSE}
-
-db_host = "localhost"
-db_port = 5432
-db_name = "censo_rm_clase"
-db_user = "postgres"
-db_password = "postgres"
-
+con = dbConnect(
+  Postgres(),
+  dbname   =  "censo_rm_clase",
+  host     = "localhost",
+  port     = 5432,
+  user     = "postgres",
+  password = "postgres"
+)
 
 # Escribimos la tabla dentro de la BD
 
 dbWriteTable(
-  con = ,
-  name = DBI::SQL("output.zonas_hipert_tmp"),
+  con,
+  name = DBI::SQL("output.zonas_hipert_tmpor"),
   value = zonas_hipert,
   row.names = FALSE
 )
@@ -291,6 +292,8 @@ zonas_gs$geocodigo = as.character(zonas_gs$geocodigo)
 # unimos las zonas gs e hipert por medio de geocódigo
 
 zonas_gs_hipert = left_join(zonas_gs, zonas_hipert, by = "geocodigo")
+
+
 ```
 
 dentro de esto, se guardó un data frame en la base de datos. posterior se lee desde la base de datos las zonas censales urbanas de ciertas comunas/provincias, donde se ajusta el tipo de dato de la columna que identifica cada zona. Finalmente se unen los datos de zonas censales con los datos de hipertensión usando el geocódigo como clave.

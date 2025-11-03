@@ -174,28 +174,20 @@ names(zonas_hipert) <- c("geocodigo", "porc_hipertension")
 #--------------------------------------------------
 # conexion a base de datos
 #--------------------------------------------------
-
-db_host = "localhost"
-db_port = 5432
-db_name = "censo_rm_clase"
-db_user = "postgres"
-db_password = "postgres"
-
-# Conexión
 con = dbConnect(
   Postgres(),
-  dbname   = db_name,
-  host     = db_host,
-  port     = db_port,
-  user     = db_user,
-  password = db_password
+  dbname   =  "censo_rm_clase",
+  host     = "localhost",
+  port     = 5432,
+  user     = "postgres",
+  password = "postgres"
 )
 
 # Escribimos la tabla dentro de la BD
 
 dbWriteTable(
-  con = ,
-  name = DBI::SQL("output.zonas_hipert_tmp"),
+  con,
+  name = DBI::SQL("output.zonas_hipert_tmpor"),
   value = zonas_hipert,
   row.names = FALSE
 )
