@@ -1,0 +1,345 @@
+---
+title: "Microsimulación de la Prevalencia arterial en la Región Metropolitana"
+author: "Catalina López"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+# 1. Introducción
+
+La microsimulación corresponde a una herramienta implementada en estadistica para estimar el comportamiento de variables individuales o a un nivel espacial más detallado, por medio de la combianción de distintas fuentes de datos. Para el caso del ámbito territorial, este tipo de técnica ayuda a realizar estimaciones locales de variables sociales o de salud.
+
+Dentro de las variables que pueden resultar relevantes de microsimular es posible destacar aquellas relacionadas a la salud de la población como la hipertensión arterial. Este corresponde a un indicador critico de salud pública asociado al envejecimiento, estilo de vida y condiciones socioecinómicas, siendo esta enfermedad uno de los principales factores de riesgo de enfermedades cardiovasculares, y su distribución desigual puede reflejar tanto condiciones estructurales del entorno o también la accesibilidad a servicios de salud.
+
+Es así, que se desarrollará una microsimulación espacial, utilizando el paquete "rakeR", el cual ajusta los pesos de una encuesta individual, de manera que las distribuciones marginales de variables demografias, como lo son la edad, el sexo, la escolaridad, coincidad con observaciones de otras encuentas, obteniendo una representación sistética de la población.
+
+las fuentes informativas con las que se trabajará corresponden a la encuenta CASEN 2022 y el CENSO 2017, donde el área de estudio será la región metropolitana, específicamente el Gran Santiago, que corresponde a la zona más urbanizada y poblada de Chile, donde es posible identifiar diferencias socioespaciales. Así se determinará la prevalencia a nivel terriorial de la hipertensión arterial a el nivel de zona censal, con el objetivo de identificar patrones y evaluar las relaciones que se puedan presentar con relación al sexo o edad de la población.
+
+# 2. Objetivo
+
+## 2.1. Objetivo general
+
+Estimar la prevalencia de hipertensión arterial en la Región Metropolitana mediante técnicas de microsimulación combinando datos del Censo y la Encuesta CASEN.
+
+## 2.2. Objetivos específicos
+
+1.  Aplicar el método de calibración por *raking* para ajustar la estructura demográfica de la CASEN a la del Censo.
+2.  Generar microdatos sintéticos con variables sociodemográficas y de salud.
+3.  Calcular la prevalencia estimada de hipertensión arterial por zona censal.
+4.  Representar espacialmente los resultados mediante mapas temáticos.
+
+# 3. Desarrollo
+
+## 3.1. Librerias
+
+Para el desarrollo de este estudio se implementaron las siguientes librerias en r:
+
+```{r librerias, echo=TRUE, message=FALSE, warning=FALSE}
+library(rakeR)
+library(RPostgres)
+library(DBI)
+library(dplyr)
+library(sf)
+library(ggplot2)
+```
+
+## 3.2. Entradas
+
+Como base de datos principal se utilizó la CASEN, que proporciona información detallada sobre condiciones de vida, salud y características sociodemográficas de la población chilena.
+
+Complementariamente, se incorporó información proveniente del CENSO 2017, que permitió asociar los registros individuales a unidades territoriales censales (zonas o manzanas).
+
+```{r entradas, echo=TRUE, message=FALSE, warning=FALSE}
+# casen en formato .rds
+
+ruta_casen = "../../../data/casen_rm.rds"
+ruta_censo = "../../../data/cons_censo_df.rds"
+
+casen_raw = readRDS(ruta_casen)
+cons_censo_df = readRDS(ruta_censo)
+
+```
+
+## 3.3. Pre-procesamiento
+
+Previo a la microsimulación, los datos fueron sometidos a un proceso de limpieza y estructuración, donde se realizó:
+
+**-** Desde el CENSO se seleccionaron variables relevantes para representar la esctructura demográfica de la población, donde se identificaron nibeles de edad, escolaridad y sexo, los que se implementaron en la distribución de la población de referenca para así ajustar la microsimulación.
+
+```{r datos censo, echo=TRUE, message=FALSE, warning=FALSE}
+## datos CENSO
+# Extraemos los nombres de las columnas que nos son útiles
+col_cons = sort(setdiff(names(cons_censo_df), c("GEOCODIGO", "COMUNA")))
+
+
+# Generamos los niveles para edad, escolaridad y sexo
+
+age_levels = grep("^edad", col_cons, value = TRUE)
+esc_levels = grep("^esco", col_cons, value = TRUE)
+sexo_levels = grep("^sexo", col_cons, value = TRUE)
+```
+
+\- Por parte de la CASEN, se extraeron las variables para el análisis y se descartaron las que no eran necesarias de implementar ya que no aplicaban para este estudio. de aquí se obtuvo la variable s28 que corresponde si las personas recibieron un tratamiento medico frente a una serie de enfermedades, donde posteriormente se filtró la hipertensión.
+
+```{r datos casen, echo=TRUE, message=FALSE, warning=FALSE}
+# Se seleccionan las variables de interés
+
+vars_base = c("estrato", # Para extraer comuna
+              "esc", # Para años de escolaridad 
+              "edad",
+              "sexo",
+              "e6a",
+              "s28") # s28= variable a microsimular
+
+# Se filtra la CASEN con las variables de interés
+casen = casen_raw[, vars_base, drop = FALSE]
+
+
+# Limpiar memoria
+# Importante para objetos muy grandes
+rm(casen_raw)
+
+```
+
+-Para evitar conflictos en las operaciones numericas y estadísticas se realizó una homogenización de los datos.
+
+```{r homogenización, echo=TRUE, message=FALSE, warning=FALSE}
+# Extraemos la comuna para cada registro
+casen$Comuna = substr(as.character(casen$estrato), 1, 5)
+
+# Se elimina la columna estrato
+casen$estrato = NULL
+
+
+# Quitar etiquetas haven y cambiar tipo de datos
+casen$esc = as.integer(unclass(casen$esc))
+casen$edad = as.integer(unclass(casen$edad))
+casen$e6a = as.numeric(unclass(casen$e6a))
+casen$sexo = as.integer(unclass(casen$sexo))
+casen$s28 = as.integer(unclass(casen$s28))
+
+```
+
+-Como se mencionó con anterioridad, la variable extraida de la CASEN se trnasformo en ina variable binaria para trabajar el análisis de interés asociado a la hipertensión arterial.
+
+```{r binario, echo=TRUE, message=FALSE, warning=FALSE}
+#  Crear variable binaria de hipertensión
+casen <- casen %>%
+  mutate(
+    hipertension = case_when(
+      s28 == 1 ~ 1,        # Tratamiento por hipertensión arterial
+      s28 > 1 ~ 0,         # Otros tratamientos médicos
+      s28 == -88 ~ NA_real_  # No responde / no aplica
+    )
+  )
+```
+
+-Para los valores faltantes de la escolaridad, se realizó una imputación lineal basado en la regresión de la variable e6a como predictora.
+
+```{r e6a, echo=TRUE, message=FALSE, warning=FALSE}
+# Imputación lineal de esc en base a e6a
+idx_na = which(is.na(casen$esc))
+
+# Ajustar modelo con casos en donde no hay na's
+fit = lm(esc ~ e6a, data = casen[-idx_na,])
+
+# Predicción para los casos con NA
+pred = predict(fit, newdata = casen[idx_na, ,drop = FALSE])
+
+# Imputar acotada
+casen$esc[idx_na] = as.integer(round(pmax(0, pmin(29, pred))))
+
+
+# Añadimos a un ID único
+casen$ID = as.character(seq_len(nrow(casen)))
+
+#Filtrar casos válidos
+casen <- casen %>% filter(!is.na(hipertension))
+
+
+```
+
+-Finalmente las variables cuantitativas fueron transformados en categóricas discretas para armonizar la estructura de la CASEN y la del CENSO.
+
+```{r re-codificación, echo=TRUE, message=FALSE, warning=FALSE}
+## re-codificación
+
+# Categorización de edad
+casen$edad_cat = cut(
+  casen$edad,
+  breaks = c(0,30,40,50,60,70,80,Inf),
+  labels = age_levels,
+  right = FALSE, include.lowest = TRUE
+)
+
+# Categorización de Escolaridad
+casen$esc_cat = factor(
+  with(casen,
+       ifelse(esc == 0, esc_levels[1],
+              ifelse(esc <= 8, esc_levels[2],
+                     ifelse(esc <= 12, esc_levels[3],
+                            esc_levels[4])))),
+  levels = esc_levels
+)
+
+# Recodificación de sexo
+casen$sexo_cat = factor(
+  ifelse(casen$sexo == 2, sexo_levels[1],
+         ifelse(casen$sexo == 1, sexo_levels[2], NA)),
+  levels = sexo_levels
+)
+
+```
+
+## 3.4. Microsimulación
+
+El proceso de microsimulación se desarrolló con el paquete rakeR, el cual permite generar las estimaciones locales.
+
+dentro de lo que se realizó en esta etapa se encuentra la siguiente estructura:
+
+-Se desagregaron los datos censales por comuna, junto con los de la casen. Este proceso permitió aplicar los pesos y la calibración.
+
+```{r desagregación, echo=TRUE, message=FALSE, warning=FALSE}
+# crear la lista de constraints POR COMUNA
+cons_censo_comunas = split(cons_censo_df, cons_censo_df$COMUNA)
+
+# Lista de INDS 
+inds_list = split(casen, casen$Comuna)
+```
+
+-En cada iteración se selecciona los registros por comuna analizada. Se aplico el método de ajuste iterativo proporcional, el cual asigna los pesos a cada individuo de la casen. Posteriormente se hizo la enterización de los pesos para obtener la población sintética compuesta por individuos completos. Finalmente se integraron los resultados comunales en una unica base denominada som_df.
+
+```{r registro por comuna, echo=TRUE, message=FALSE, warning=FALSE}
+
+ sim_list = lapply(names(cons_censo_comunas), function(zona) {
+  cons_i    = cons_censo_comunas[[zona]]
+  col_order = sort(setdiff(names(cons_i), c("COMUNA","GEOCODIGO")))
+  cons_i    = cons_i[, c("GEOCODIGO", col_order), drop = FALSE]
+  
+  tmp    = inds_list[[zona]]
+  inds_i = tmp[, c("ID","edad_cat","esc_cat","sexo_cat"), drop = FALSE]
+  names(inds_i) = c("ID","Edad","Escolaridad","Sexo")
+  
+  
+  
+  w_frac  = weight(cons = cons_i, inds = inds_i,
+                   vars = c("Edad","Escolaridad","Sexo"))
+  sim_i   = integerise(weights = w_frac, inds = inds_i, seed = 123)
+  merge(sim_i,
+        tmp[, c("ID","hipertension")],
+        by = "ID", all.x = TRUE)
+})
+
+# Data Frame de toda la población
+sim_df = data.table::rbindlist(sim_list, idcol = "COMUNA")
+
+```
+
+-Así, se calcularon los promedios de la hipertensión por zonas censales, expresandose en porcentaje.
+
+```{r hipertensión, echo=TRUE, message=FALSE, warning=FALSE}
+
+# Se agregan los datos
+zonas_hipert = aggregate(
+  hipertension ~ zone,
+  data = sim_df,
+  FUN = function(x) mean(x, na.rm = TRUE) * 100
+)
+names(zonas_hipert) <- c("geocodigo", "porc_hipertension")
+
+
+
+```
+
+## 3.5. Conexión BD
+
+Una vez hecha la microsimulación, se realizó una conexión a la base de datos del censo 2017 de la RM:
+
+```{r conexiones, echo=TRUE, message=FALSE, warning=FALSE}
+
+db_host = "localhost"
+db_port = 5432
+db_name = "censo_rm_clase"
+db_user = "postgres"
+db_password = "postgres"
+
+
+# Escribimos la tabla dentro de la BD
+
+dbWriteTable(
+  con = ,
+  name = DBI::SQL("output.zonas_hipert_tmp"),
+  value = zonas_hipert,
+  row.names = FALSE
+)
+
+# leer zonas censales
+
+query_gs = "SELECT *
+FROM dpa.zonas_censales_rm
+WHERE urbano = 1 AND (
+      nom_provin = 'SANTIAGO' OR
+	  nom_comuna IN ('PUENTE ALTO', 'SAN BERNARDO')
+) "
+
+zonas_gs = st_read(con, query = query_gs)
+
+# ajuste del tipo de dato a character
+
+zonas_gs$geocodigo = as.character(zonas_gs$geocodigo)
+
+# unimos las zonas gs e hipert por medio de geocódigo
+
+zonas_gs_hipert = left_join(zonas_gs, zonas_hipert, by = "geocodigo")
+```
+
+dentro de esto, se guardó un data frame en la base de datos. posterior se lee desde la base de datos las zonas censales urbanas de ciertas comunas/provincias, donde se ajusta el tipo de dato de la columna que identifica cada zona. Finalmente se unen los datos de zonas censales con los datos de hipertensión usando el geocódigo como clave.
+
+# 4. Resultados
+
+## 4.1. Visualización de resultados
+
+Una vez hecho el proceso, se obtienen los siguientes resultados:
+
+```{r visualización, echo=FALSE, message=FALSE, warning=FALSE}
+
+ggplot(zonas_gs_hipert) +
+  geom_sf(aes(fill = porc_hipertension), color = NA) +
+  scale_fill_viridis_c(
+    option = "plasma",
+    name = "% hipertensión",
+    direction = -1
+  ) +
+  labs(
+    title = "Prevalencia de hipertensión arterial en la RM",
+    subtitle = "Microsimulación basada en CASEN y Censo",
+    caption = "Fuente: elaboración propia a partir de CASEN y CENSO"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "right",
+    plot.title = element_text(face = "bold", size = 14),
+    plot.subtitle = element_text(size = 10),
+    axis.text = element_blank(),
+    axis.ticks = element_blank()
+  )
+
+```
+
+Es posible identificar mayores concentraciones de hipertensión arterial en zonas del surponiente del gran santiago, mientras que los valores más bajos se concentran hacia el nororiente, coincidiendo con sectores de mayor nivel socioeconómico. Estos patrones se relacionan estrechamente con la distribución etaria y las condiciones de salud asociadas al envejecimiento, así como con determinantes sociales como la educación, el ingreso y el acceso a servicios de salud. El gradiente espacial observado resulta coherente con los estudios de desigualdades territoriales en salud en el área metropolitana.
+
+De todas formas, el fenómeno se desarrolla con patrones no tan evidentes, lo que tambine puede estar influenciado con el envejecimiento general de la población, al presentar bajas natalidades, es coherente que el envejecimineto general aumente la presencia de enfermedades enc la población.
+
+# 5. Conclusión
+
+La microsimulación aplicada permitió desagregar la información de la CASEN a un nivel territorial detallado, evidenciando diferencias significativas dentro de áreas urbanas. Los resultados indican que la hipertensión arterial presenta una mayor prevalencia en sectores con menor nivel socioeconómico, reflejando así las desigualdades asociadas a los determinantes sociales de la salud. Este tipo de análisis proporciona información relevante para la planificación territorial y la formulación de políticas públicas, facilitando la focalización de estrategias preventivas y de atención médica. La utilización de la metodología rakeR se confirma como una herramienta eficaz para integrar datos de encuestas y censos, incrementando la resolución espacial de indicadores sociales y de salud y fortaleciendo la capacidad de análisis y toma de decisiones.
+
+# 6. Bibliografía
+
+-   Ministerio de Desarrollo Social y Familia (2023). *Encuesta CASEN 2022*.
+
+-   Instituto Nacional de Estadísticas (INE). *Censo de Población y Vivienda 2017*.
+
+-   Biblioteca del Congreso Nacional (BCN). *Región Metropolitana de Santiago: antecedentes territoriales y demográficos*.
+
+-   Lovelace, R., & Ballas, D. (2013). *Microsimulation for policy evaluation at the small-area level: An introduction to the R package rakeR*. *Journal of Statistical Software*, 54(13).
