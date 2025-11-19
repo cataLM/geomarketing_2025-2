@@ -1,0 +1,536 @@
+---
+title: "Clusterización de la prevalencia arterial en la Región Metropolitana"
+author: "Catalina López"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+# 1. Introducción
+
+El análisis territorial mediante técnicas cuantitativas permite revelar patrones espaciales que no son evidentes a simple vista, especialmente cuando se trabaja con unidades geográficas pequeñas, como las zonas censales. En este estudio se aborda la caracterización socioespacial del Gran Santiago a partir de información microsimulada en el Trabajo 2, donde se generaron estimaciones de hipertensión arterial e ingreso per cápita utilizando una integración de datos pertenecientes a la CASEN y Censo 2017 con el fin de evaluar el coportamiento de la variable microsimulada, se incorporarán 2 variables comparativas, correspondientes a el ingreso per cápita y la edad de las personas, haciendo una separación de mayores y menores de 60 años..
+
+Teniendo de base lo obtenido en la microsimulación, se busca realizar un análisis exploratorio más completo mediante la aplicación de técnicas de agrupamiento no supervisado (clustering). Aplicar este tipo de técnicas permite identificar grupos de zonas censales que comparten atributos similares, revelando estructuras latentes que no dependen de límites administrativos y que pueden diferir significativamente entre comunas y al interior de ellas. Adicionalmente, se incorporan las variables demográficas relevantes mencionadascon el fin de enriquecer la interpretación multidimensional de los patrones detectados.
+
+Junto con esto, se implementará el índice de Shannon como medida de diversidad territorial, para evaluar la variabilidad interna de los clusters por comuna y así complementar la evaluación. Esto permite identificar comunas homogéneas y heterogéneas en sus patrones internos, aportando una mirada que supera los promedios comunales tradicionales y entrega una lectura espacial más fina y robusta.
+
+Finalmente se realizará una reflexión con respecto a los resultados obtenidos en el trabajo 2 y lo logrado con la clusterización, llegando a conclusiones de su aplicación, y comparando estos para realzar las diferencias y complementaciones de estas técnicas aplicadas.
+
+# 2. Objetivo
+
+## 2.1. Objetivo General
+
+Aplicar técnicas de clusterización para clasificar las zonas censales del Gran Santiago utilizando como variable principal aquella microsimulada en el Trabajo 2 (hipertensión arterial), complementada con ingreso per cápita y estructura etaria, con el fin de identificar patrones socioespaciales latentes y evaluar su utilidad para el análisis territorial.
+
+## 2.2. Objetivos Específicos
+
+1.  incorporar a la variable microsimulada de hipertensión, el ingreso per cápita y la proporción de adultos mayores (60+) para aplicar el análisis comparativo.
+2.  Determinar el número óptimi de clusters implementando el método del codo y aplicar K-means para clasificar las zonas censales según las tres variables seleccionadas.
+3.  Comparar la hipertensión con cada variable por separado (ingreso y edad), analizando sus relaciones y diferencias antes de la clusterización.
+4.  Realizar un mapa final que muestre los clusters resultantes basados en las tres variables simultáneamente.
+5.  Aplicar el índice de Shannon para evaluar la diversidad interna de clusters al interior de cada comuna y representar sus resultados en un mapa comunal.
+
+# 3. Desarrollo
+
+## 3.1. Librerias
+
+Las librerias invocadas en este trabajo para poder desarrollar los procesos aplicados corresponden a las siguientes:
+
+```{r librerias, echo=TRUE, message=FALSE, warning=FALSE}
+library(rakeR)
+library(RPostgres)
+library(DBI)
+library(dplyr)
+library(sf)
+library(ggplot2)
+library(data.table)
+library(factoextra)
+library(GGally)
+library(cowplot)
+```
+
+## 3.2. Resultado Microsimulación
+
+A continuación se presenta el mapa obtenido de la microsimulación del Trabajo 2, siendo este nuestra base para desarrollar el agrupamiento y análisis posterior.
+
+En este se identificaron mayor presencia de hipertensión en habitantes del sur, surponiente del Gran santiago, representado igualmetne una diversidad media en el norponiente de esta enfermedad, y menor presencia de esta en el sector oriente, lo que en primera instancia se pudo relacionar a que aquellas comunas donde la hipertensión es menor son las más enriquecidas del Gran Santiago, lo que relaciona que una mejor posicioón socioeconómica te da mayor acceso a servisios y tratamientos de salud lo que puede ayudar a disminuir la prevalencia de esta enfermedad.
+
+```{r microsimulacion, echo=FALSE, message=FALSE, warning=FALSE}
+#-------------------------------------
+## Entradas
+#-------------------------------------
+
+ruta_casen = "../../../data/casen_rm.rds"
+ruta_censo = "../../../data/cons_censo_df.rds"
+
+casen_raw = readRDS(ruta_casen)
+cons_censo_df = readRDS(ruta_censo)
+
+
+#--------------------------------------
+# PRE-PROCESAMIENTO
+#--------------------------------------
+
+## datos CENSO
+col_cons = sort(setdiff(names(cons_censo_df), c("GEOCODIGO", "COMUNA")))
+
+age_levels  = grep("^edad", col_cons, value = TRUE)
+esc_levels  = grep("^esco", col_cons, value = TRUE)
+sexo_levels = grep("^sexo", col_cons, value = TRUE)
+
+
+## datos CASEN 
+vars_base = c(
+  "estrato",
+  "esc",
+  "edad",
+  "sexo",
+  "e6a",
+  "s28",   # hipertensión
+  "ypc"    # ingreso per cápita agregado
+)
+
+casen = casen_raw[, vars_base, drop = FALSE]
+rm(casen_raw)
+
+casen$Comuna = substr(as.character(casen$estrato), 1, 5)
+casen$estrato = NULL
+
+casen$esc  = as.integer(unclass(casen$esc))
+casen$edad = as.integer(unclass(casen$edad))
+casen$e6a  = as.numeric(unclass(casen$e6a))
+casen$sexo = as.integer(unclass(casen$sexo))
+casen$s28  = as.integer(unclass(casen$s28))
+casen$ypc  = as.numeric(unclass(casen$ypc))
+
+#--------------------------------------
+# Sincronizar hipertensión desde s28
+#--------------------------------------
+
+casen <- casen %>%
+  mutate(
+    hipertension = case_when(
+      s28 == 1 ~ 1,
+      s28 > 1 ~ 0,
+      s28 == -88 ~ NA_real_
+    )
+  )
+
+# Imputación lineal de esc
+idx_na = which(is.na(casen$esc))
+fit = lm(esc ~ e6a, data = casen[-idx_na,])
+pred = predict(fit, newdata = casen[idx_na, , drop = FALSE])
+casen$esc[idx_na] = as.integer(round(pmax(0, pmin(29, pred))))
+
+casen$ID = as.character(seq_len(nrow(casen)))
+casen <- casen %>% filter(!is.na(hipertension))
+
+
+#-----------------------------------------
+# Re-codificación
+#-----------------------------------------
+
+casen$edad_cat = cut(
+  casen$edad,
+  breaks = c(0,30,40,50,60,70,80,Inf),
+  labels = age_levels,
+  right = FALSE,
+  include.lowest = TRUE
+)
+
+casen$esc_cat = factor(
+  with(casen,
+       ifelse(esc == 0, esc_levels[1],
+              ifelse(esc <= 8,  esc_levels[2],
+                     ifelse(esc <= 12, esc_levels[3],
+                            esc_levels[4])))),
+  levels = esc_levels
+)
+
+casen$sexo_cat = factor(
+  ifelse(casen$sexo == 2, sexo_levels[1],
+         ifelse(casen$sexo == 1, sexo_levels[2], NA)),
+  levels = sexo_levels
+)
+
+
+#-----------------------------------------
+# MICROSIMULACIÓN
+#-----------------------------------------
+
+cons_censo_comunas = split(cons_censo_df, cons_censo_df$COMUNA)
+inds_list = split(casen, casen$Comuna)
+
+sim_list = lapply(names(cons_censo_comunas), function(zona) {
+  
+  cons_i    = cons_censo_comunas[[zona]]
+  col_order = sort(setdiff(names(cons_i), c("COMUNA","GEOCODIGO")))
+  cons_i    = cons_i[, c("GEOCODIGO", col_order), drop = FALSE]
+  
+  tmp    = inds_list[[zona]]
+  inds_i = tmp[, c("ID","edad_cat","esc_cat","sexo_cat"), drop = FALSE]
+  names(inds_i) = c("ID","Edad","Escolaridad","Sexo")
+  
+  w_frac = weight(
+    cons = cons_i,
+    inds = inds_i,
+    vars = c("Edad","Escolaridad","Sexo")
+  )
+  
+  sim_i = integerise(weights = w_frac, inds = inds_i, seed = 123)
+  
+  # ⬅︎ AQUÍ agregamos ambas variables: hipertensión + ypc
+  merge(sim_i,
+        tmp[, c("ID","hipertension","ypc")],
+        by = "ID", all.x = TRUE)
+})
+
+# DF completo de población microsimulada
+sim_df = data.table::rbindlist(sim_list, idcol = "COMUNA")
+
+
+#-----------------------------------------
+# AGREGADOS POR ZONA
+#-----------------------------------------
+
+zonas_hipert = sim_df %>%
+  group_by(zone) %>%
+  summarise(porc_hipertension = mean(hipertension, na.rm = TRUE) * 100) %>%
+  rename(geocodigo = zone)
+
+zonas_ypc = sim_df %>%
+  group_by(zone) %>%
+  summarise(mediana_ingreso = median(ypc, na.rm = TRUE)) %>%
+  rename(geocodigo = zone)
+
+
+edad_mayores_60 = c("edad_60_70", "edad_70_80", "edad_mayor_80")
+
+zonas_edad = sim_df %>%
+  mutate(es_mayor60 = ifelse(Edad %in% edad_mayores_60, 1, 0)) %>%
+  group_by(zone) %>%
+  summarise(porc_mayores_60 = mean(es_mayor60, na.rm = TRUE) * 100) %>%
+  rename(geocodigo = zone)
+
+
+#-----------------------------------------
+# Conexión BD
+#-----------------------------------------
+
+con = dbConnect(
+  Postgres(),
+  dbname   = "censo_rm_clase",
+  host     = "localhost",
+  port     = 5432,
+  user     = "postgres",
+  password = "postgres"
+)
+
+dbWriteTable(
+  con,
+  name = DBI::SQL("output.zonas_hipert_fi"),
+  value = zonas_hipert,
+  row.names = FALSE
+)
+
+dbWriteTable(
+  con,
+  name = DBI::SQL("output.zonas_ypc_fi"),
+  value = zonas_ypc,
+  row.names = FALSE
+)
+
+dbWriteTable(
+  con, name = DBI::SQL("output.zonas_edad_fi"),
+  value = zonas_edad, row.names = FALSE
+)
+#-----------------------------------------
+# Lectura zonas censales + unión
+#-----------------------------------------
+
+query_gs = "
+SELECT *
+FROM dpa.zonas_censales_rm
+WHERE urbano = 1 AND (
+      nom_provin = 'SANTIAGO' OR
+      nom_comuna IN ('PUENTE ALTO', 'SAN BERNARDO')
+)"
+
+zonas_gs = st_read(con, query = query_gs)
+zonas_gs$geocodigo = as.character(zonas_gs$geocodigo)
+
+zonas_gs <- zonas_gs %>%
+  left_join(zonas_hipert, by = "geocodigo") %>%
+  left_join(zonas_ypc,    by = "geocodigo") %>%
+  left_join(zonas_edad,   by = "geocodigo")     
+
+# Guardar en BD
+st_write(
+  zonas_gs,
+  dsn = con,
+  layer = DBI::SQL("output.zc_hipert_ingreso_edad_microsim",
+                   driver = "PostgreSQL")
+)
+
+#----------------------------------------------
+# VISUALIZACIÓN (Hipertensión)
+#----------------------------------------------
+
+ggplot(zonas_gs) +
+  geom_sf(aes(fill = porc_hipertension), color = NA) +
+  scale_fill_viridis_c(option = "plasma", name = "% hipertensión", direction = -1) +
+  labs(
+    title = "Prevalencia de hipertensión arterial en la RM",
+    subtitle = "Microsimulación basada en CASEN y Censo",
+    caption = "Fuente: elaboración propia"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "right",
+    axis.text = element_blank(),
+    axis.ticks = element_blank()
+  )
+
+
+```
+
+## 3.3. Clustering
+
+En primera instacia, al comenzar este proceso, se seleccionan las tres variables para la agrupación. Para este caso de estudio corresponde a la variable microsimulada (hipertensión) y las 2 que nos complementarán el proceso y análisis (ingreso y edad).
+
+posteriormente es necesario realizar una limpieza de los datos de las tablas debido a quepara ejecutar k-means se necesitan valores numéricos, y así poder estandarizan las variables. Esta estandarización permite que las variables contribuyan por igual al algoritmo K-means.
+
+esta parte de código se vislumbra a continuación:
+
+```{r inicio clustering, echo=TRUE, message=FALSE, warning=FALSE}
+# Seleccionar variables NUMÉRICAS 
+vars_clusters <- zonas_gs %>%
+  st_drop_geometry() %>%
+  select(porc_hipertension, mediana_ingreso, porc_mayores_60)
+
+# Eliminar filas con NA
+complete_rows <- complete.cases(vars_clusters)
+vars_clusters <- vars_clusters[complete_rows, ]
+zonas_gs_clust <- zonas_gs[complete_rows, ]
+
+# Escalar
+vars_scaled <- scale(vars_clusters)
+```
+
+### 3.3.1. Método del codo
+
+Se utiliza el método del codo (WSS), que permite observar en qué punto dejar de aumentar el número de clusters, ya que la ganancia de cohesión interna disminuye.
+
+```{r metodo del codo, echo=FALSE, message=FALSE, warning=FALSE}
+#---------------------------------------------------------
+# Elegir número óptimo de clusters (método del codo)
+#---------------------------------------------------------
+fviz_nbclust(vars_scaled, kmeans, method = "wss") +
+  labs(
+    title = "Método del codo",
+    x = "Número de clusters",
+    y = "Inercia intra-cluster (WSS)"
+  )
+
+```
+
+Como se visualiza en el gráfico, la mayor diferencia se observa al tercer codo, debido a que posteriormente la curva se comienza a suavizar y se estabiliza, por ende el análisis es posible desarrollarlo de manera correscta con 3 clusters, sin perder grupos importantes y considerando aquellos necesarios para una buena interpretación.
+
+Así, es posible ejecutar k-means para reconocer los patrones territoriales considerando las variables a aplicar. Así cada zona censar recibe un número de cluster que mejor representa la situación presente.
+
+esto es posible revisarlo en las siguientes líneas de código:
+
+```{r k-means, echo=TRUE, message=FALSE, warning=FALSE}
+# Ejecutar K-Means
+set.seed(123)
+km <- kmeans(vars_scaled, centers = 3, nstart = 20)
+#------------------------------------------------------------
+# Agregar resultado de clusters a la capa espacial 
+#------------------------------------------------------------
+zonas_gs_clust$cluster <- as.factor(km$cluster)
+
+# Estadísticas por cluster
+cluster_stats <- zonas_gs_clust %>%
+  st_drop_geometry() %>%   
+  group_by(cluster) %>%
+  summarise(
+    hipert_mean = mean(porc_hipertension),
+    ingreso_median = median(mediana_ingreso),
+    mayores60_mean = mean(porc_mayores_60)
+  )
+
+print(cluster_stats)
+
+
+```
+
+### 3.3.2. Cluster Hipertensión v/s Ingreso
+
+Posteriormente pasamos al analisis bivariado donde se tienen 2 graficos resultantes.
+
+en primera instancia, como se observa a continuación, se tiene el gráfico donde se relaciona la hipertensión con el nivel de ingreso de las zonas censales.
+
+```{r hipert v/s ingr, echo=FALSE, message=FALSE, warning=FALSE}
+#hipertension v/s ingreso
+ggplot(zonas_gs_clust, aes(x = mediana_ingreso,
+                           y = porc_hipertension,
+                           color = cluster)) +
+  geom_point(alpha = 0.7, size = 2) +
+  scale_color_viridis_d() +
+  labs(
+    title = "Relación entre hipertensión e ingreso por cluster",
+    x = "Ingreso mediano",
+    y = "% Hipertensión"
+  ) +
+  theme_minimal()
+
+```
+
+Aquí se evidencian 3 grupos, los cuales representan:
+
+cluster 1: ingreso bajo, hipertensión media
+
+cluster 2: ingreso alto, hipertensión media
+
+cluster 3: ingreso bajo, hipertensión alta
+
+De este grafico es posible hacer una primera relación, donde se puede inferir que las personas con mayores ingresos no suelen tener altos indices de esta enfermedad, lo que se puede atribuir a un mejor acceso a salud debido a recursos económicos. Por otra parte se tienen dos claros grupos en el bajo ingreso, donde hay un porcentaje con alto indice de hipertensión y otro más bien medio, lo que reafirma lo que se sugiere en primera isntancia. ahora, estos dos grupos que se generan con el cluster 1 y 3 podrían representar su diferencia en la edad de las personas.
+
+### 3.3.3. Cluster Hipertensión v/s Edad
+
+En segundo lugar, se tiene el gráfico que relaciona la hipertensión con la edad de las personas, donde estas se separan prinicipalmente en 2 grupos, para términos de realización del análisis, los cuales se representan en el porcentaje mayor de 60 años.
+
+```{r hipert v/s edad, echo=FALSE, message=FALSE, warning=FALSE}
+#hipertension v/S edad
+ggplot(zonas_gs_clust, aes(x = porc_mayores_60,
+                           y = porc_hipertension,
+                           color = cluster)) +
+  geom_point(alpha = 0.7, size = 2) +
+  scale_color_viridis_d() +
+  labs(
+    title = "Relación entre hipertensión y proporción de mayores de 60 años",
+    x = "% mayores de 60",
+    y = "% Hipertensión"
+  ) +
+  theme_minimal()
+
+```
+
+Aquí se distinguen los siguientes cluster:
+
+cluster 1: bajo porcentaje de personas mayores, baja hipertensión
+
+cluster 2: porcentaje medio de personas mayores, hipertensión media
+
+cluster 3: alto porcentaje de personas mayores, alto porcentaje de hipertensión
+
+Este gráfico complementa y rectifica lo deducido en el gráfico anterior, donde es pposible identificar que hay una directa relación entre la edad y la hipertensión, donde a mayor porcentaje de adultos mayores, la presencia de esta enfermedad se hace más recurrente.
+
+### 3.3.4. Mapa de Cluster combinados
+
+Ahora, se genera un mapa donde cada zona censal aparece coloreada según su cluster, permitiendo observar patrones espaciales como la concentración de clusters específicos en comunas, transiciones espaciales y sectores socioeconómicos diferenciados.
+
+```{r mapa, echo=FALSE, message=FALSE, warning=FALSE}
+#--------------------------------------------
+# Mapa con geometría intacta
+#--------------------------------------------
+ggplot(zonas_gs_clust) +
+  geom_sf(aes(fill = cluster), color = NA) +
+  scale_fill_brewer(palette = "Set2") +
+  labs(
+    title = "Clusters de Zonas Censales del Gran Santiago",
+    subtitle = "Basados en hipertensión, ingreso y envejecimiento"
+  ) +
+  theme_void()
+
+```
+
+los cluster presentes de este mapa representan:
+
+cluster 1: jovenes de ingreso medio-bajo, y baja hipertensión
+
+cluster 2: personas de gran ingreso envejecidos, con hipertensión media
+
+cluster 3: personas vulnerables envejecidad, con hipertensión alta
+
+Realizando un análisis general del mapa, se identifica un patron claro en el sector nororiente dado por el cluster 2 anaranjado, donde se evidencia un alto ogreso, personas de mayor edad y un indice medio de la enfermedad. En el resto de las comunas y zonas censales del Gran Santiago se identifican parches donde se van cruzando aquella poblacion de menor edad, ingresos medios y baja presencia de hipertensión y la poblacion envejecida más vulnerable que posee altos indices de la enfermedad.
+
+Ahora bien, el cluster 3 tiene mayor presencia en el sector sur y poniente del mapa, lo que representa que las personas mayores se concentran a estos sectores, además poseen bajo acceso a salud, debido la su bulnerabilidad económica, acresentando la enfermedad.
+
+El cluster 2 se ve con fuerza en la zona centro y un poco mas al norponiente del mapa, lo que indicaía que en estos sectores prevalece población más joven, que no tiene alta presencia de hiperstensión.
+
+## 3.4. Índice de Shannon
+
+Finalmente, con el objetivo de evaluar la diversidad interna de los cluster para cada comuna, se evidencia el índice de shannon.
+
+Para este se agruparon y contaron las zonas censales por comuna, donde los valores altos representan comunas heterogeneas, y los valores bajos aquellas donde hay mayor homogeneidad.
+
+```{r indice, echo=FALSE, message=FALSE, warning=FALSE}
+#--------------------------------------
+# Indice de shannon
+#---------------------------------------
+# Crear geometría única por comuna usando st_union
+comunas_sf <- zonas_gs_clust %>%
+  group_by(nom_comuna) %>%
+  summarise(geometry = st_union(geom)) %>%
+  st_as_sf()
+
+#indice shannon
+
+shannon_comunas <- zonas_gs_clust %>%
+  st_drop_geometry() %>% 
+  group_by(nom_comuna, cluster) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  mutate(p = n / sum(n)) %>%
+  group_by(nom_comuna) %>%
+  summarise(shannon = -sum(p * log(p)))
+
+#unir indice a la geometria comunal
+comunas_shannon_map <- comunas_sf %>%
+  left_join(shannon_comunas, by = "nom_comuna")
+#mapa final indice shannon
+
+ggplot(comunas_shannon_map) +
+  geom_sf(aes(fill = shannon), color = NA) +
+  scale_fill_viridis_c(option = "magma", na.value = "grey90") +
+  labs(
+    title = "Índice de Shannon por Comuna",
+    subtitle = "Diversidad de Clusters dentro de cada Comuna",
+    fill = "Shannon"
+  ) +
+  theme_minimal()
+
+
+
+```
+
+Como se observa en el mapa, en general se detecta una gran heterogeneidad en las comunas, debido a que en el sector nororiente hay presencia de 1 cluster, y en el resto del Gran Santiago se equilibran los otros dos, dando patrones más marcados destacandose alguno de los dos.
+
+De las comunas que presentan mayor heterogeneidad de cluster están Puente Alto, Maipú, Santiago y La Florida.
+
+# 4. Análisis General
+
+En primera instancia, del resultado obtenido en el mapa que combina las 3 variables y las presenta en el Gran Santiago, se rectifica la relación: a mayor edad y menor ingreso, mayor presencia de hipertensión. Esto viene a evidenciar que la hipertensión se presenta con mayor fuerza en personas mayores empobrecidad, lo que significa un deficit en el acceso a la salud, permitiendo llevar una vida saludable, si afeccion en la calidad de vida de las personas, reflejando también una desigualdad social frente a enfermedades. Esta relacion se puede corroborar y confirmar con estudios existentes como el denominado: Desigualdad de ingresos y control de la hipertensión. Publicado en la Revista de la Asociación Americana del Corazón donde se menciona textual:  "...Estos hallazgos indican que un nivel socioeconómico bajo, representado por los ingresos familiares, se asoció con un peor control de la presión arterial y un mayor riesgo de resultados adversos en un entorno que brindó acceso a un tratamiento uniforme para la hipertensión a todos los participantes, independientemente de su nivel socioeconómico...". También otros estudios relacionan otras enfermedades como diabetes y obesidad a los bajos ingresos. si bien la relación directra de la edad y la enfermedad es algo que se puede considerar más habital o natural en el desarrollo y presencia de estas, el ingreso refleja problemas de acceso a atención de salud, problemas asociados a mala alimentación o dificil acceso incluso a actividades recreativas (actividad fisica), debido a falta de espacios que permitan el desarrollo de este o no poder acceder por los costos asociados, lo que conlleva a desarrollar más enfermedades en la vejéz.
+
+El índice de shannon nos permite identificar claros patrones de esctructura socio-espacial bastante clara, donde el ingreso, la edad y la hipertensión se organizan de manera que coinciden con la segregación urbana que se presenta en el Gran Santiago.
+
+Finanlemte, relacionando lo obtenido en el Trabajo 2 con lo desarrollado con anterioridad, plantea una buena relación, donde las similitudes de los resultados son evidentes, ya que se detectan patrones similades de presencia de hipertensión del Gran Santiago, rectificando que ambos son métodos interesantes de aplicar para analizar los problemas que se presentan en una área dev estudio de interés, y una buena forma de combinar diferengtes fuentes de información para detectar problemas que se presenten en el territorio, identificar patrones y ver como se comportan de manera espacial para buscar soluciones para estas. Ahora bien, la realización de cluster permite dar mayor rectificación y encontrar indicadores que se relacionan con los problemas que se evidenian en la microsimulación, los cuales en el trabajo 2 fueron especulativos de los por qué del comportamiento de la hipertensión. Ya con la aplicación de estas nuevas técnicas se pudo establecer las relaciones directar de otras variables que explican el fenómento y así evidenciar su comportamiento en el territorio.
+
+Este tipo de análisis es útil paras idenfitifacar problemas y afectaciones de la ciudadania, y evaluar posibles políticas públicas que mejoren la calidad de vida de las personas, como por ejemplo, donde sería una óptima localización de un centro de salud dado la distribución de la hipertensión en el territorio.
+
+# 5. Conclusiones
+
+El análisis realizado permitió integrar técnicas de microsimulación y agrupamiento territorial para caracterizar las zonas censales del Gran Santiago a partir de tres dimensiones clave: prevalencia de hipertensión, envejecimineto poblacional e ingreso medio, donde la combinación de estas variables permitió identificar patrones socioespaciales coherentes con la estructura urbana segregada de la ciudad, que se ha presentado historicamente.
+
+Los resultados del clustering mostraron tres configuraciones territoriales bien diferenciadas que permitieron hacer interpretaciones de cómo era el comportamiento y la prevalencia de esta enfermedad en el territorio. Por otro ladso el índice de shannon permitió profundizar en la variabilidad interna de las comunas, mostrando que algunas presentan una mayor diversidad de configuraciones socio-demográficas a nivel de zona censal. Esto evidencia la importancia de trabajar en escalas fines, pues la heterogeneidad intracomunal puede quedar oculta cuando se analizan unidades territoriales más agregadas.
+
+En conjunto, el trabajo demuestra que la integración entre la microsimualción y el análisis espacial multivariado permite revelar patrones latentes que fortalecen la interpretación territorial y entregan información relevante para la planificación urbana y la salud pública. Además, confirma que las desigualdades socioeconómicas y los gradientes de salud en Santiago no solo están presentes entre comunas, sino también dentro de ellas, reforzando la necesidad de enfoques de análisis con mayor resolu
+
+# 6. Bibliografía
+
+Estudio de desigualdad de ingresos y control de la hipertensión: <https://www.ahajournals.org/doi/10.1161/JAHA.119.013636#>
+
+BCN. (2023). *Desigualdades territoriales en la Región Metropolitana: Diagnóstico socioeconómico comunal*. Biblioteca del Congreso Nacional.
+
+Ministerio de Salud de Chile (MINSAL) – Resultados de la Encuesta Nacional de Salud 2016‑2017 : <https://epi.minsal.cl/encuesta-ens-descargable/>
+
+Gobierno Regional de Valparaíso. (2021). *Diagnóstico territorial de determinantes sociales de la salud*. <https://diprece.minsal.cl/>
